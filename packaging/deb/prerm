@@ -1,0 +1,15 @@
+#!/bin/sh
+# roottrace-collector prerm: the Debian twin of the RPM %preun scriptlet.
+# On removal, stop the service and undo the host integration (ACLs, audit
+# rules, auditd plugin conf) while the helper still exists, so `apt remove`
+# leaves no RootTrace state behind.
+set -e
+
+case "$1" in
+  remove)
+    systemctl --no-reload disable --now roottrace-collector.service >/dev/null 2>&1 || true
+    /usr/sbin/roottrace-collector-setup remove >/dev/null 2>&1 || true
+    ;;
+esac
+
+exit 0

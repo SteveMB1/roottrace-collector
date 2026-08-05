@@ -1,0 +1,44 @@
+# RootTrace collector systemd unit (native package).
+#
+# Native installs upgrade through dnf/apt, never by rewriting their own files.
+# ReadWritePaths covers only the state directory because /usr is immutable at
+# runtime.
+# Override settings with a drop-in (systemctl edit roottrace-collector), not
+# by editing this file: the package owns it.
+
+[Unit]
+Description=RootTrace read-only diagnostics collector
+Documentation=https://roottrace.io/docs/collector/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roottrace-collector
+Group=roottrace-collector
+# Journal read access for the kernel/journal checks; drop with a drop-in and
+# ROOTTRACE_KERNEL_JOURNAL_ACCESS=false to keep it off.
+SupplementaryGroups=systemd-journal
+EnvironmentFile=/etc/roottrace/collector.env
+ExecStart=/usr/bin/roottrace-collector --loop
+# Planned process recycle; matches the ROOTTRACE_MAX_RUNTIME_SECONDS default.
+RuntimeMaxSec=86400
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/roottrace-collector
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+#!/bin/sh
+# roottrace-collector postinst: service user, state-dir ownership, systemd.
+# The Debian twin of the RPM %pre/%post scriptlets.
+set -e
+
+case "$1" in
+  configure)
+    # The retired shell installer wrote a higher-precedence unit in /etc
+    # which points at /opt/roottrace-collector. Remove only that recognizable
+    # generated unit so systemd can use the package-owned unit under /usr.
+    legacy_unit=/etc/systemd/system/roottrace-collector.service
+    legacy_enabled=false
+    legacy_active=false
+    if [ -f "$legacy_unit" ] &&
+      grep -qF 'ExecStartPre=+/opt/roottrace-collector/update_collector.sh' "$legacy_unit"; then
+      systemctl is-enabled roottrace-collector.service >/dev/null 2>&1 && legacy_enabled=true
+      systemctl is-active roottrace-collector.service >/dev/null 2>&1 && legacy_active=true
+      rm -f "$legacy_unit"
+    fi
+
+    if ! getent group roottrace-collector >/dev/null 2>&1; then
+      addgroup --system roottrace-collector
+    fi
+    if ! getent passwd roottrace-collector >/dev/null 2>&1; then
+      adduser --system --ingroup roottrace-collector \
+        --home /var/lib/roottrace-collector --no-create-home \
+        --shell /usr/sbin/nologin roottrace-collector
+    fi
+    # dpkg unpacks everything root:root; hand the state dir to the service.
+    chown roottrace-collector:roottrace-collector /var/lib/roottrace-collector
+    chmod 0750 /var/lib/roottrace-collector
+    chmod 0600 /etc/roottrace/collector.env || true
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$legacy_enabled" = true ]; then
+      systemctl reenable roottrace-collector.service >/dev/null 2>&1 || true
+    fi
+    if [ "$legacy_active" = true ]; then
+      systemctl restart roottrace-collector.service >/dev/null 2>&1 || true
+    fi
+    # Upgrade: restart only if it was running; fresh installs stay stopped
+    # until the operator fills in the token and enables the unit.
+    if [ -n "$2" ] && [ "$legacy_active" != true ]; then
+      systemctl try-restart roottrace-collector.service >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

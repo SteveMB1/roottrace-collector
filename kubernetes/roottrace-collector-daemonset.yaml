@@ -1,0 +1,193 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: roottrace
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: roottrace-collector
+  namespace: roottrace
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: roottrace-collector-readonly
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects", "scaledjobs"]
+    verbs: ["get", "list"]
+  - nonResourceURLs: ["/version"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: roottrace-collector-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: roottrace-collector-readonly
+subjects:
+  - kind: ServiceAccount
+    name: roottrace-collector
+    namespace: roottrace
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: roottrace-collector
+  namespace: roottrace
+  labels:
+    app.kubernetes.io/name: roottrace-collector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: roottrace-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: roottrace-collector
+    spec:
+      serviceAccountName: roottrace-collector
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: collector
+          # The zero digest is a fail-closed placeholder. Render this manifest
+          # with the verified agent digest from the release manifest.
+          image: public.ecr.aws/h4o5i5r8/roottrace/agent@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          args: ["--loop"]
+          envFrom:
+            - configMapRef:
+                name: roottrace-collector-config
+                optional: true
+            - secretRef:
+                name: roottrace-collector
+                optional: true
+          env:
+            - name: ROOTTRACE_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: roottrace-collector-config
+                  key: ROOTTRACE_API_URL
+            - name: ROOTTRACE_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: roottrace-collector-config
+                  key: ROOTTRACE_INTERVAL_SECONDS
+                  optional: true
+            - name: ROOTTRACE_MAX_RUNTIME_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: roottrace-collector-config
+                  key: ROOTTRACE_MAX_RUNTIME_SECONDS
+                  optional: true
+            - name: ROOTTRACE_STREAMING
+              valueFrom:
+                configMapKeyRef:
+                  name: roottrace-collector-config
+                  key: ROOTTRACE_STREAMING
+                  optional: true
+            - name: ROOTTRACE_COLLECTOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: roottrace-collector
+                  key: ROOTTRACE_COLLECTOR_TOKEN
+            - name: ROOTTRACE_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ROOTTRACE_PROVIDER
+              value: kubernetes
+            - name: ROOTTRACE_ENABLED_CHECKS
+              value: disk,inode,disk_io,swap,memory,cpu,network,tcp,process,kernel,kubernetes,kubernetes_node,collector_self
+            - name: ROOTTRACE_PROC_ROOT
+              value: /host/proc
+            - name: ROOTTRACE_DISK_PATHS
+              value: /host
+            - name: ROOTTRACE_SERVICE_NAME
+              value: kubernetes-node
+            - name: ROOTTRACE_SERVICE_TYPE
+              value: kubernetes
+            - name: ROOTTRACE_KUBERNETES_POD_CHECKS
+              value: "true"
+            - name: ROOTTRACE_CUSTOM_METRICS_PATHS
+              value: /app/additional_monitors
+            - name: ROOTTRACE_CUSTOM_METRICS_MAX_FILES
+              value: "16"
+            - name: ROOTTRACE_LINUX_AUDIT_ENABLED
+              # Host audit logs are normally root-only. Enable this only in a
+              # site overlay that grants the non-root collector explicit read
+              # access to the host log.
+              value: "false"
+            - name: ROOTTRACE_LINUX_AUDIT_LOG_PATHS
+              value: /host/var/log/audit/audit.log
+            - name: ROOTTRACE_LINUX_AUDIT_BATCH_EVENTS
+              value: "250"
+            - name: ROOTTRACE_LINUX_AUDIT_STREAMING
+              value: "false"
+            - name: ROOTTRACE_LINUX_AUDIT_MAX_BYTES_PER_CYCLE
+              value: "4194304"
+            - name: ROOTTRACE_LINUX_AUDIT_INITIAL_LOOKBACK_BYTES
+              value: "1048576"
+            - name: ROOTTRACE_LINUX_AUDIT_RESOLVE_USERS
+              value: "true"
+            - name: ROOTTRACE_LINUX_AUDIT_UID_CACHE_SIZE
+              value: "4096"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/roottrace-collector
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: state
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

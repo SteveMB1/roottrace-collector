@@ -1,0 +1,19 @@
+Package: roottrace-collector
+Version: __VERSION__-__RELEASE__
+Section: admin
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), systemd, adduser
+Recommends: acl, python3-psycopg2, python3-pymongo
+Maintainer: RootTrace <support@roottrace.io>
+Homepage: https://roottrace.io/docs/collector/
+Description: RootTrace read-only diagnostics collector
+ Outbound-only, read-only diagnostics collector for RootTrace. Sends
+ heartbeats and diagnostics to the RootTrace API over short-lived HTTPS
+ requests; opens no inbound ports, executes no remediation, and mutates
+ no customer configuration.
+ .
+ Configure /etc/roottrace/collector.env, run
+ roottrace-collector-setup apply, then enable
+ roottrace-collector.service. Shipped as plain Python source: what runs
+ on the host is byte-identical to what an auditor reads.

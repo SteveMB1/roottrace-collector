@@ -1,0 +1,716 @@
+#!/bin/sh
+# RootTrace collector host integration helper (native package)
+#   -> /usr/sbin/roottrace-collector-setup
+#
+# Host-specific integration stays explicit and reversible:
+#
+#   roottrace-collector-setup apply     grant read-only log/kubeconfig ACLs,
+#                                       enable the SELinux nis_enabled boolean,
+#                                       install the STIG audit rules and the
+#                                       auditd realtime plugin
+#   roottrace-collector-setup remove    undo everything apply created; the
+#                                       package runs this on erase so
+#                                       dnf/apt removal leaves nothing behind
+#
+# apply honors the ROOTTRACE_* toggles in /etc/roottrace/collector.env
+# (ROOTTRACE_LINUX_AUDIT_*, ROOTTRACE_NGINX_LOG_ACCESS, ...). Rerunning apply
+# is idempotent; rerun it after changing those toggles.
+
+set -eu
+
+CONFIG_FILE=/etc/roottrace/collector.env
+COLLECTOR_USER=roottrace-collector
+STATE_DIR=/var/lib/roottrace-collector
+PLUGIN_WRAPPER=/usr/libexec/roottrace-collector/auditd-plugin.sh
+
+say() {
+  echo "RootTrace: $*"
+}
+
+warn() {
+  echo "RootTrace: $*" >&2
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this helper as root, for example with sudo." >&2
+    exit 1
+  fi
+}
+
+load_config() {
+  [ -f "$CONFIG_FILE" ] || return 0
+
+  # Sourcing executes the file as shell, so refuse unless it is still
+  # root-owned and not group/world-writable. The package installs it 0600
+  # root:root; this guards against an operator loosening it to "debug" and
+  # turning a config edit into root code execution.
+  owner="$(stat -c '%U' "$CONFIG_FILE" 2>/dev/null || stat -f '%Su' "$CONFIG_FILE" 2>/dev/null || echo '?')"
+  perm="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || echo '?')"
+  if [ "$owner" != "root" ]; then
+    echo "refusing to source ${CONFIG_FILE}: not owned by root (owner ${owner})." >&2
+    exit 1
+  fi
+  # Reject if group- or world-writable: the 2 (write) bit in either the group
+  # digit (second-to-last) or the other digit (last). *[2367] catches
+  # other-writable; *[2367][0-7] catches group-writable.
+  case "$perm" in
+    *[2367]|*[2367][0-7])
+      echo "refusing to source ${CONFIG_FILE}: group/world-writable (mode ${perm}); run: chmod 600 ${CONFIG_FILE}" >&2
+      exit 1
+      ;;
+  esac
+
+  set -a
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+  set +a
+}
+
+# ── SELinux ───────────────────────────────────────────────────────────────────
+
+enable_selinux_nis_boolean() {
+  [ "${ROOTTRACE_SELINUX_NIS_ENABLED:-true}" != "false" ] || return 0
+  command -v getsebool >/dev/null 2>&1 || return 0
+  command -v setsebool >/dev/null 2>&1 || return 0
+  getsebool nis_enabled >/dev/null 2>&1 || return 0
+  getsebool nis_enabled 2>/dev/null | grep -q ' --> on' && return 0
+
+  if setsebool -P nis_enabled 1 >/dev/null 2>&1; then
+    say "enabled SELinux nis_enabled boolean for NSS/SSSD-backed user lookups."
+  else
+    warn "could not enable SELinux nis_enabled boolean; continuing."
+  fi
+}
+
+# ── Read-only ACLs ────────────────────────────────────────────────────────────
+
+give_file_read_acl() {
+  path="$1"
+
+  [ -n "$path" ] || return 0
+  case "$path" in
+    *'*'*|*'?'*) return 0 ;;
+  esac
+  if [ -L "$path" ]; then
+    warn "skipping symlinked log ACL target ${path}."
+    return 0
+  fi
+
+  if [ -d "$path" ]; then
+    setfacl -m "u:${COLLECTOR_USER}:--x" "$path" 2>/dev/null || true
+    setfacl -m "d:u:${COLLECTOR_USER}:r--" "$path" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ -f "$path" ]; then
+    dir="$(dirname "$path")"
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+      setfacl -m "u:${COLLECTOR_USER}:--x" "$dir" 2>/dev/null || true
+      setfacl -m "d:u:${COLLECTOR_USER}:r--" "$dir" 2>/dev/null || true
+    fi
+    setfacl -m "u:${COLLECTOR_USER}:r--" "$path" 2>/dev/null || true
+  fi
+}
+
+drop_file_read_acl() {
+  path="$1"
+
+  [ -n "$path" ] || return 0
+  case "$path" in
+    *'*'*|*'?'*) return 0 ;;
+  esac
+  [ -e "$path" ] || return 0
+
+  if [ -d "$path" ]; then
+    setfacl -x "u:${COLLECTOR_USER}" "$path" 2>/dev/null || true
+    setfacl -x "d:u:${COLLECTOR_USER}" "$path" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ -f "$path" ]; then
+    dir="$(dirname "$path")"
+    if [ -d "$dir" ]; then
+      setfacl -x "u:${COLLECTOR_USER}" "$dir" 2>/dev/null || true
+      setfacl -x "d:u:${COLLECTOR_USER}" "$dir" 2>/dev/null || true
+    fi
+    setfacl -x "u:${COLLECTOR_USER}" "$path" 2>/dev/null || true
+  fi
+}
+
+nginx_acl_targets() {
+  nginx_dir="${ROOTTRACE_NGINX_LOG_DIR:-/var/log/nginx}"
+  printf '%s\n' "${nginx_dir} ${ROOTTRACE_NGINX_ACCESS_LOG_PATH:-} ${ROOTTRACE_NGINX_ACCESS_LOG_PATHS:-} ${ROOTTRACE_NGINX_ERROR_LOG_PATH:-} ${ROOTTRACE_NGINX_ERROR_LOG_PATHS:-}" | tr ',' ' '
+}
+
+audit_acl_targets() {
+  printf '%s\n' "/var/log/audit ${ROOTTRACE_LINUX_AUDIT_LOG_PATHS:-/var/log/audit/audit.log}" | tr ',' ' '
+}
+
+kubeconfig_acl_targets() {
+  printf '%s\n' "${ROOTTRACE_KEDA_KUBECONFIG:-} ${ROOTTRACE_KUBERNETES_KUBECONFIG:-} ${ROOTTRACE_KUBECONFIG:-} ${KUBECONFIG:-} /etc/roottrace/kubeconfig /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /etc/rancher/k3s/k3s.yaml /etc/rancher/rke2/rke2.yaml /var/snap/microk8s/current/credentials/client.config" | tr ':,' '  '
+}
+
+grant_log_acls() {
+  if [ "${ROOTTRACE_NGINX_LOG_ACCESS:-true}" = "false" ] &&
+    [ "${ROOTTRACE_LINUX_AUDIT_ACCESS:-true}" = "false" ]; then
+    return 0
+  fi
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    warn "setfacl is unavailable; skipping read-only log ACL setup."
+    return 0
+  fi
+
+  if [ "${ROOTTRACE_NGINX_LOG_ACCESS:-true}" != "false" ]; then
+    for path in $(nginx_acl_targets); do
+      give_file_read_acl "$path"
+      if [ -d "$path" ]; then
+        for file in "$path"/access.log "$path"/access.log.1 "$path"/error.log "$path"/error.log.1; do
+          [ -f "$file" ] && [ ! -L "$file" ] && setfacl -m "u:${COLLECTOR_USER}:r--" "$file" 2>/dev/null || true
+        done
+      fi
+    done
+  fi
+
+  if [ "${ROOTTRACE_LINUX_AUDIT_ACCESS:-true}" != "false" ]; then
+    for path in $(audit_acl_targets); do
+      give_file_read_acl "$path"
+      if [ -d "$path" ]; then
+        for file in "$path"/audit.log "$path"/audit.log.[0-9]*; do
+          [ -f "$file" ] && [ ! -L "$file" ] && setfacl -m "u:${COLLECTOR_USER}:r--" "$file" 2>/dev/null || true
+        done
+      fi
+    done
+  fi
+}
+
+grant_kubeconfig_acls() {
+  [ "${ROOTTRACE_KUBECONFIG_ACCESS:-${ROOTTRACE_KEDA_KUBECONFIG_ACCESS:-true}}" != "false" ] || return 0
+  if ! command -v setfacl >/dev/null 2>&1; then
+    warn "setfacl is unavailable; skipping read-only Kubernetes kubeconfig ACL setup."
+    return 0
+  fi
+
+  for path in $(kubeconfig_acl_targets); do
+    [ -f "$path" ] || continue
+    give_file_read_acl "$path"
+  done
+}
+
+remove_acls() {
+  command -v setfacl >/dev/null 2>&1 || return 0
+
+  for path in $(nginx_acl_targets); do
+    drop_file_read_acl "$path"
+    if [ -d "$path" ]; then
+      for file in "$path"/access.log "$path"/access.log.1 "$path"/error.log "$path"/error.log.1; do
+        [ -f "$file" ] && setfacl -x "u:${COLLECTOR_USER}" "$file" 2>/dev/null || true
+      done
+    fi
+  done
+
+  for path in $(audit_acl_targets); do
+    drop_file_read_acl "$path"
+    if [ -d "$path" ]; then
+      for file in "$path"/audit.log "$path"/audit.log.[0-9]*; do
+        [ -f "$file" ] && setfacl -x "u:${COLLECTOR_USER}" "$file" 2>/dev/null || true
+      done
+    fi
+  done
+
+  for path in $(kubeconfig_acl_targets); do
+    [ -f "$path" ] || continue
+    drop_file_read_acl "$path"
+  done
+}
+
+# ── Linux audit rules ─────────────────────────────────────────────────────────
+
+audit_native_arch() {
+  case "$(uname -m 2>/dev/null || true)" in
+    x86_64|amd64|aarch64|arm64|ppc64|ppc64le|s390x|riscv64) echo "b64" ;;
+    *)
+      [ "$(getconf LONG_BIT 2>/dev/null || echo 64)" = "32" ] && echo "b32" || echo "b64"
+      ;;
+  esac
+}
+
+audit_syscall_supported() {
+  syscall="$1"
+  command -v ausyscall >/dev/null 2>&1 || return 1
+  ausyscall --exact "$syscall" >/dev/null 2>&1 && return 0
+  ausyscall --help 2>&1 | grep -q -- '--exact' && return 1
+  ausyscall --dump 2>/dev/null | awk -v syscall="$syscall" '$2 == syscall { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+audit_syscall_equivalents() {
+  case "$1" in
+    chmod) echo "fchmodat fchmodat2" ;;
+    chown|lchown) echo "fchownat" ;;
+    rename) echo "renameat renameat2" ;;
+    unlink|rmdir) echo "unlinkat" ;;
+    open|creat) echo "openat openat2" ;;
+    umount) echo "umount2" ;;
+    *) return 1 ;;
+  esac
+}
+
+audit_syscall_rule_text() {
+  rule_id="$1"
+  syscall_names="$2"
+  filters="$3"
+  arch="${ROOTTRACE_LINUX_AUDIT_ARCH:-$(audit_native_arch)}"
+  supported=""
+
+  for syscall in $(printf '%s\n' "$syscall_names" | tr ',' ' '); do
+    if audit_syscall_supported "$syscall"; then
+      case " $supported " in
+        *" $syscall "*) ;;
+        *) supported="${supported}${supported:+ }${syscall}" ;;
+      esac
+      continue
+    fi
+
+    equivalents=""
+    for equivalent in $(audit_syscall_equivalents "$syscall" 2>/dev/null || true); do
+      if audit_syscall_supported "$equivalent"; then
+        case " $supported $equivalents " in
+          *" $equivalent "*) ;;
+          *) equivalents="${equivalents}${equivalents:+ }${equivalent}" ;;
+        esac
+      fi
+    done
+
+    if [ -n "$equivalents" ]; then
+      warn "audit syscall ${syscall} is not available for ${rule_id}; covering it with ${equivalents}."
+      for equivalent in $equivalents; do
+        case " $supported " in
+          *" $equivalent "*) ;;
+          *) supported="${supported}${supported:+ }${equivalent}" ;;
+        esac
+      done
+    else
+      warn "skipping unsupported audit syscall ${syscall} for ${rule_id}."
+    fi
+  done
+
+  if [ -z "$supported" ]; then
+    warn "skipping audit rule ${rule_id}; no listed syscalls are supported on this host."
+    return 0
+  fi
+
+  printf '## %s\n' "$rule_id"
+  printf -- '-a always,exit -F arch=%s' "$arch"
+  for syscall in $supported; do
+    printf ' -S %s' "$syscall"
+  done
+  printf ' %s\n' "$filters"
+}
+
+append_audit_syscall_rule() {
+  rule_file="$1"
+  shift
+  audit_syscall_rule_text "$@" >> "$rule_file"
+}
+
+remove_audit_rule_files() {
+  removed=false
+  for file in "$@"; do
+    if [ -f "$file" ]; then
+      rm -f "$file" 2>/dev/null && removed=true
+    fi
+  done
+  [ "$removed" = "true" ] && warn "removed generated audit rule files so auditd can continue to start."
+}
+
+audit_is_immutable() {
+  command -v auditctl >/dev/null 2>&1 || return 1
+  auditctl -s 2>/dev/null | awk '$1 == "enabled" && $2 == "2" { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+build_audit_rules_file() {
+  rules_dir="$1"
+  output_file="/etc/audit/audit.rules"
+  output_dir="$(dirname "$output_file")"
+
+  [ -d "$output_dir" ] || return 0
+  # Stage the temp file in the root-owned output directory, never in
+  # STATE_DIR: STATE_DIR is owned by the unprivileged collector user, so a
+  # root write there is a symlink/TOCTOU target. Same directory also makes
+  # the final mv an atomic rename rather than a cross-filesystem copy.
+  tmp_file="$(mktemp "${output_dir}/.roottrace-audit.XXXXXX")" || return 0
+
+  {
+    echo "## This file is automatically generated from ${rules_dir}"
+    for file in "$rules_dir"/*.rules; do
+      [ -f "$file" ] || continue
+      cat "$file"
+      echo
+    done
+  } > "$tmp_file"
+
+  chown root:root "$tmp_file" 2>/dev/null || true
+  chmod 0640 "$tmp_file" 2>/dev/null || true
+  mv "$tmp_file" "$output_file"
+}
+
+write_audit_rules() {
+  AUDIT_RULES_WRITTEN=false
+
+  [ "${ROOTTRACE_LINUX_AUDIT_ENABLED:-true}" != "false" ] || return 0
+  [ "${ROOTTRACE_LINUX_AUDIT_STIG_RULES:-false}" != "false" ] || return 0
+
+  rules_dir="${ROOTTRACE_LINUX_AUDIT_RULES_DIR:-/etc/audit/rules.d}"
+  if [ ! -d "$(dirname "$rules_dir")" ]; then
+    warn "audit rules directory parent not found; skipping Linux audit rules."
+    return 0
+  fi
+  mkdir -p "$rules_dir" 2>/dev/null || {
+    warn "could not create ${rules_dir}; skipping Linux audit rules."
+    return 0
+  }
+
+  reset_file="${rules_dir}/00-roottrace-rhel9-stig-reset.rules"
+  stig_file="${rules_dir}/30-roottrace-rhel9-stig.rules"
+  finalize_file="${rules_dir}/99-roottrace-rhel9-stig-finalize.rules"
+
+  # Clean up the differently-named rule files older installs wrote.
+  rm -f "${rules_dir}/20-roottrace-command-exec.rules" "${rules_dir}/roottrace-command-exec.rules" 2>/dev/null || true
+
+  audit_backlog_limit="${ROOTTRACE_LINUX_AUDIT_BACKLOG_LIMIT:-8192}"
+  audit_backlog_wait_time="${ROOTTRACE_LINUX_AUDIT_BACKLOG_WAIT_TIME:-0}"
+  cat > "$reset_file" <<EOF
+## RootTrace RHEL 9 STIG V2R8 audit reset rules.
+-D
+## Raise the kernel audit backlog buffer well above the default of 64 so bursty
+## workloads (yum/dnf, package installs) do not fill the queue and get throttled.
+-b ${audit_backlog_limit}
+## Do not block syscalls waiting for the audit queue to drain (0 = drop under
+## extreme burst instead of pausing the process). Set >0 to prefer completeness.
+--backlog_wait_time ${audit_backlog_wait_time}
+EOF
+
+  {
+    echo "## RootTrace RHEL 9 STIG V2R8 audit rules."
+    echo "## Syscall rules are generated for the host native audit arch."
+  } > "$stig_file"
+
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654010 uid exec privilege" "execve" "-C uid!=euid -F euid=0 -k execpriv"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654010 gid exec privilege" "execve" "-C gid!=egid -F egid=0 -k execpriv"
+  # Every exec, not just privilege-changing ones. This is what corroborates an
+  # APM security signal: the SDK reports that the application spawned a
+  # process, and this is the kernel independently recording the same exec. An
+  # attacker would have to defeat both to hide.
+  #
+  # DELIBERATELY UNFILTERED BY auid. The obvious rule is
+  # `-F auid>=1000 -F auid!=unset`, which every other rule here uses, and it
+  # would miss the entire case this exists for: a service started by systemd
+  # has no login uid, so a compromised web app spawning a shell has auid unset
+  # and would be filtered out.
+  #
+  # Exec is a per-process event, so the volume is bounded by how many processes
+  # the host starts -- unlike file auditing, which is per-open and is why this
+  # rule set watches only *denied* opens (-EPERM/-EACCES) and never successful
+  # ones. Hosts that fork constantly (CI runners, shell-heavy cron) can turn
+  # this off without losing the STIG rules above.
+  if [ "${ROOTTRACE_LINUX_AUDIT_EXEC:-true}" != "false" ]; then
+    append_audit_syscall_rule "$stig_file" "RootTrace command execution" "execve" "-k roottrace_exec"
+  fi
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654015 permission changes" "chmod,fchmod,fchmodat" "-F auid>=1000 -F auid!=unset -k perm_mod"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654020 ownership changes" "chown,fchown,fchownat,lchown" "-F auid>=1000 -F auid!=unset -k perm_mod"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654025 extended attribute changes by users" "setxattr,fsetxattr,lsetxattr,removexattr,fremovexattr,lremovexattr" "-F auid>=1000 -F auid!=unset -k perm_mod"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654025 extended attribute changes by root" "setxattr,fsetxattr,lsetxattr,removexattr,fremovexattr,lremovexattr" "-F auid=0 -k perm_mod"
+  cat >> "$stig_file" <<'EOF'
+## RHEL-09-654030
+-a always,exit -F path=/usr/bin/umount -F perm=x -F auid>=1000 -F auid!=unset -k privileged-mount
+## RHEL-09-654035
+-a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_mod
+## RHEL-09-654040
+-a always,exit -F path=/usr/bin/setfacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_mod
+## RHEL-09-654045
+-a always,exit -F path=/usr/bin/chcon -F perm=x -F auid>=1000 -F auid!=unset -k perm_mod
+## RHEL-09-654050
+-a always,exit -F path=/usr/sbin/semanage -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654055
+-a always,exit -F path=/usr/sbin/setfiles -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654060
+-a always,exit -F path=/usr/sbin/setsebool -F perm=x -F auid>=1000 -F auid!=unset -F key=privileged
+EOF
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654065 deletions" "rename,unlink,rmdir,renameat,unlinkat" "-F auid>=1000 -F auid!=unset -k delete"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654070 permission denied access" "truncate,ftruncate,creat,open,openat,open_by_handle_at" "-F exit=-EPERM -F auid>=1000 -F auid!=unset -k perm_access"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654070 access denied access" "truncate,ftruncate,creat,open,openat,open_by_handle_at" "-F exit=-EACCES -F auid>=1000 -F auid!=unset -k perm_access"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654075 module removal" "delete_module" "-F auid>=1000 -F auid!=unset -k module_chng"
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654080 module loading" "init_module,finit_module" "-F auid>=1000 -F auid!=unset -k module_chng"
+  cat >> "$stig_file" <<'EOF'
+## RHEL-09-654085
+-a always,exit -F path=/usr/bin/chage -F perm=x -F auid>=1000 -F auid!=unset -k privileged-chage
+## RHEL-09-654090
+-a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+## RHEL-09-654095
+-a always,exit -F path=/usr/bin/crontab -F perm=x -F auid>=1000 -F auid!=unset -k privileged-crontab
+## RHEL-09-654100
+-a always,exit -F path=/usr/bin/gpasswd -F perm=x -F auid>=1000 -F auid!=unset -k privileged-gpasswd
+## RHEL-09-654105
+-a always,exit -F path=/usr/bin/kmod -F perm=x -F auid>=1000 -F auid!=unset -k modules
+## RHEL-09-654110
+-a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+## RHEL-09-654115
+-a always,exit -F path=/usr/sbin/pam_timestamp_check -F perm=x -F auid>=1000 -F auid!=unset -k privileged-pam_timestamp_check
+## RHEL-09-654120
+-a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=unset -k privileged-passwd
+## RHEL-09-654125
+-a always,exit -F path=/usr/sbin/postdrop -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654130
+-a always,exit -F path=/usr/sbin/postqueue -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654135
+-a always,exit -F path=/usr/bin/ssh-agent -F perm=x -F auid>=1000 -F auid!=unset -k privileged-ssh
+## RHEL-09-654140
+-a always,exit -F path=/usr/libexec/openssh/ssh-keysign -F perm=x -F auid>=1000 -F auid!=unset -k privileged-ssh
+## RHEL-09-654145
+-a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=unset -k privileged-priv_change
+## RHEL-09-654150
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+## RHEL-09-654155
+-a always,exit -F path=/usr/bin/sudoedit -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+## RHEL-09-654160
+-a always,exit -F path=/usr/sbin/unix_chkpwd -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654165
+-a always,exit -F path=/usr/sbin/unix_update -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654170
+-a always,exit -F path=/usr/sbin/userhelper -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+## RHEL-09-654175
+-a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=unset -k privileged-usermod
+## RHEL-09-654180
+-a always,exit -F path=/usr/bin/mount -F perm=x -F auid>=1000 -F auid!=unset -k privileged-mount
+## RHEL-09-654185
+-a always,exit -F path=/usr/sbin/init -F perm=x -F auid>=1000 -F auid!=unset -k privileged-init
+## RHEL-09-654190
+-a always,exit -F path=/usr/sbin/poweroff -F perm=x -F auid>=1000 -F auid!=unset -k privileged-poweroff
+## RHEL-09-654195
+-a always,exit -F path=/usr/sbin/reboot -F perm=x -F auid>=1000 -F auid!=unset -k privileged-reboot
+## RHEL-09-654200
+-a always,exit -F path=/usr/sbin/shutdown -F perm=x -F auid>=1000 -F auid!=unset -k privileged-shutdown
+EOF
+  append_audit_syscall_rule "$stig_file" "RHEL-09-654205 umount syscall" "umount" "-F auid>=1000 -F auid!=unset -k privileged-umount"
+  cat >> "$stig_file" <<'EOF'
+## RHEL-09-654215
+-w /etc/sudoers -p wa -k identity
+## RHEL-09-654220
+-w /etc/sudoers.d/ -p wa -k identity
+## RHEL-09-654225
+-w /etc/group -p wa -k identity
+## RHEL-09-654230
+-w /etc/gshadow -p wa -k identity
+## RHEL-09-654235
+-w /etc/security/opasswd -p wa -k identity
+## RHEL-09-654240
+-w /etc/passwd -p wa -k identity
+## RHEL-09-654245
+-w /etc/shadow -p wa -k identity
+## RHEL-09-654250
+-w /var/log/faillock -p wa -k logins
+## RHEL-09-654255
+-w /var/log/lastlog -p wa -k logins
+## RHEL-09-654096
+-w /etc/cron.d/ -p wa -k cronjobs
+-w /var/spool/cron/ -p wa -k cronjobs
+EOF
+  cat > "$finalize_file" <<EOF
+## RootTrace RHEL 9 STIG V2R8 audit finalization rules.
+## RHEL-09-654265
+-f 2
+## RHEL-09-654270
+--loginuid-immutable
+## RHEL-09-654275
+-e 2
+EOF
+  chown root:root "$reset_file" "$stig_file" "$finalize_file" 2>/dev/null || true
+  chmod 0640 "$reset_file" "$stig_file" "$finalize_file" 2>/dev/null || true
+
+  if command -v augenrules >/dev/null 2>&1 && ! augenrules --check >/dev/null 2>&1; then
+    warn "generated audit rules failed augenrules --check; disabling RootTrace-managed audit rules."
+    remove_audit_rule_files "$reset_file" "$stig_file" "$finalize_file"
+    return 0
+  fi
+
+  AUDIT_RULES_WRITTEN=true
+}
+
+# ── auditd realtime plugin ────────────────────────────────────────────────────
+
+install_auditd_plugin() {
+  AUDIT_PLUGIN_WRITTEN=false
+
+  [ "${ROOTTRACE_LINUX_AUDIT_ENABLED:-true}" != "false" ] || return 0
+  [ "${ROOTTRACE_LINUX_AUDIT_AUDITD_PLUGIN:-true}" != "false" ] || return 0
+
+  plugin_dir="${ROOTTRACE_LINUX_AUDIT_PLUGIN_DIR:-}"
+  if [ -z "$plugin_dir" ]; then
+    if [ -d /etc/audit/plugins.d ] || [ -d /etc/audit ]; then
+      plugin_dir=/etc/audit/plugins.d
+    elif [ -d /etc/audisp/plugins.d ] || [ -d /etc/audisp ]; then
+      plugin_dir=/etc/audisp/plugins.d
+    else
+      warn "auditd plugin directory not found; Linux audit file tailing remains enabled as fallback."
+      return 0
+    fi
+  fi
+
+  command -v python3 >/dev/null 2>&1 || {
+    warn "python3 is required for the auditd plugin; Linux audit file tailing remains enabled as fallback."
+    return 0
+  }
+
+  mkdir -p "$plugin_dir"
+  plugin_conf="${plugin_dir}/roottrace.conf"
+
+  # The wrapper itself ships with the package (owned, removed on erase);
+  # only this pointer file is host state.
+  cat > "$plugin_conf" <<EOF
+active = yes
+direction = out
+path = ${PLUGIN_WRAPPER}
+type = always
+format = string
+EOF
+  chown root:root "$plugin_conf"
+  chmod 0644 "$plugin_conf"
+
+  AUDIT_PLUGIN_WRITTEN=true
+  say "installed auditd realtime plugin at ${plugin_conf}."
+}
+
+restart_audit_after_all_setup() {
+  [ "${ROOTTRACE_LINUX_AUDIT_ENABLED:-true}" != "false" ] || return 0
+  [ "${ROOTTRACE_LINUX_AUDIT_RELOAD_AUDITD:-true}" != "false" ] || {
+    warn "auditd reload skipped because ROOTTRACE_LINUX_AUDIT_RELOAD_AUDITD=false."
+    return 0
+  }
+  if [ "${AUDIT_RULES_WRITTEN:-false}" != "true" ] && [ "${AUDIT_PLUGIN_WRITTEN:-false}" != "true" ]; then
+    return 0
+  fi
+
+  if [ "${AUDIT_RULES_WRITTEN:-false}" = "true" ]; then
+    rules_dir="${ROOTTRACE_LINUX_AUDIT_RULES_DIR:-/etc/audit/rules.d}"
+    stig_file="${rules_dir}/30-roottrace-rhel9-stig.rules"
+    finalize_file="${rules_dir}/99-roottrace-rhel9-stig-finalize.rules"
+
+    if audit_is_immutable; then
+      build_audit_rules_file "$rules_dir"
+      warn "audit system is already immutable; rebuilt /etc/audit/audit.rules, but live rules cannot load until the host reboots."
+      return 0
+    fi
+
+    build_audit_rules_file "$rules_dir"
+
+    if command -v systemctl >/dev/null 2>&1 &&
+      [ "$(systemctl show audit-rules.service -p LoadState --value 2>/dev/null || true)" = "loaded" ]; then
+      if systemctl restart audit-rules.service >/dev/null 2>&1; then
+        say "restarted audit-rules.service after installing RootTrace audit rules."
+        systemctl reset-failed audit-rules.service >/dev/null 2>&1 || true
+      else
+        warn "audit-rules.service restart failed; leaving RootTrace rule files installed."
+        systemctl reset-failed audit-rules.service >/dev/null 2>&1 || true
+      fi
+    elif command -v augenrules >/dev/null 2>&1; then
+      augenrules_output="$(augenrules --load 2>&1)" && augenrules_ok=true || augenrules_ok=false
+      if [ "$augenrules_ok" = "true" ]; then
+        say "loaded RootTrace audit rules with augenrules."
+      elif printf '%s\n' "$augenrules_output" | grep -q 'Rule exists'; then
+        warn "augenrules reported duplicate live audit rules; leaving the full RootTrace rule files installed."
+      else
+        warn "could not load audit rules with augenrules; leaving RootTrace rule files installed for the next auditd load."
+      fi
+    elif command -v auditctl >/dev/null 2>&1; then
+      failed=false
+      auditctl -R "$stig_file" >/dev/null 2>&1 || failed=true
+      auditctl -R "$finalize_file" >/dev/null 2>&1 || failed=true
+      if [ "$failed" = "true" ]; then
+        warn "could not load audit rules with auditctl; leaving RootTrace rule files installed for the next auditd load."
+      else
+        say "loaded RootTrace audit rules with auditctl."
+        command -v systemctl >/dev/null 2>&1 && systemctl reset-failed audit-rules.service >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  if [ "${AUDIT_PLUGIN_WRITTEN:-false}" = "true" ]; then
+    if command -v auditctl >/dev/null 2>&1; then
+      auditctl --signal reload >/dev/null 2>&1 || true
+    fi
+    command -v systemctl >/dev/null 2>&1 && systemctl reset-failed audit-rules.service >/dev/null 2>&1 || true
+    say "asked auditd to reload its plugin configuration after all RootTrace audit files were installed."
+  fi
+}
+
+remove_audit_integration() {
+  rules_dir="${ROOTTRACE_LINUX_AUDIT_RULES_DIR:-/etc/audit/rules.d}"
+  removed_rules=false
+
+  for file in \
+    "${rules_dir}/00-roottrace-rhel9-stig-reset.rules" \
+    "${rules_dir}/30-roottrace-rhel9-stig.rules" \
+    "${rules_dir}/99-roottrace-rhel9-stig-finalize.rules" \
+    "${rules_dir}/20-roottrace-command-exec.rules" \
+    "${rules_dir}/roottrace-command-exec.rules"; do
+    if [ -f "$file" ]; then
+      rm -f "$file" && removed_rules=true
+    fi
+  done
+
+  for conf in /etc/audit/plugins.d/roottrace.conf /etc/audisp/plugins.d/roottrace.conf; do
+    if [ -f "$conf" ]; then
+      rm -f "$conf"
+      say "removed auditd plugin configuration ${conf}."
+    fi
+  done
+
+  if [ "$removed_rules" = "true" ]; then
+    if audit_is_immutable; then
+      build_audit_rules_file "$rules_dir"
+      warn "audit system is immutable; RootTrace rules unload at the next reboot."
+    else
+      build_audit_rules_file "$rules_dir"
+      if command -v augenrules >/dev/null 2>&1; then
+        augenrules --load >/dev/null 2>&1 || true
+      fi
+    fi
+    say "removed RootTrace-managed audit rules."
+  fi
+
+  if command -v auditctl >/dev/null 2>&1; then
+    auditctl --signal reload >/dev/null 2>&1 || true
+  fi
+}
+
+# ── Entry points ──────────────────────────────────────────────────────────────
+
+apply() {
+  need_root
+  load_config
+  enable_selinux_nis_boolean
+  grant_log_acls
+  grant_kubeconfig_acls
+  write_audit_rules
+  install_auditd_plugin
+  restart_audit_after_all_setup
+  say "host integration applied. Start the collector with: systemctl enable --now roottrace-collector.service"
+}
+
+remove() {
+  need_root
+  load_config
+  remove_acls
+  remove_audit_integration
+  say "host integration removed."
+}
+
+case "${1:-apply}" in
+  apply) apply ;;
+  remove) remove ;;
+  *)
+    echo "Usage: roottrace-collector-setup [apply|remove]" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,20 @@
+#!/bin/sh
+# RootTrace collector runtime wrapper (native package) -> /usr/bin/roottrace-collector
+#
+# Native packages ship the collector as plain source under /usr/libexec, so
+# this wrapper only has to find python3 and exec it.
+set -eu
+
+PYTHON_BIN="${ROOTTRACE_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3 || true)"
+fi
+if [ -z "$PYTHON_BIN" ]; then
+  echo "python3 is required to run the RootTrace collector." >&2
+  exit 1
+fi
+
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+
+exec "$PYTHON_BIN" /usr/libexec/roottrace-collector/roottrace_collector.py "$@"

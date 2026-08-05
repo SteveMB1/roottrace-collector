@@ -1,0 +1,1225 @@
+---
+- name: Install RootTrace read-only collector
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Required, and deliberately empty: set roottrace_api_url to this
+    # deployment's own /api base so a forgotten value can never send host
+    # diagnostics somewhere the operator did not choose.
+    roottrace_api_url: ""
+    roottrace_interval_seconds: 60
+    roottrace_max_runtime_seconds: 86400
+    roottrace_streaming: "false"
+    roottrace_enabled_checks: "disk,inode,disk_io,swap,memory,cpu,network,tcp,process,systemd,kernel,linux_audit,ec2,collector_self,custom"
+    roottrace_kernel_journal_access: true
+    roottrace_selinux_nis_enabled: true
+    roottrace_linux_audit_enabled: true
+    roottrace_linux_audit_access: true
+    roottrace_linux_audit_log_paths: /var/log/audit/audit.log
+    roottrace_linux_audit_batch_events: 250
+    roottrace_linux_audit_streaming: false
+    roottrace_linux_audit_auditd_plugin: true
+    roottrace_linux_audit_stig_rules: false
+    roottrace_linux_audit_backlog_limit: 8192
+    roottrace_linux_audit_backlog_wait_time: 0
+    roottrace_linux_audit_rules_dir: /etc/audit/rules.d
+    roottrace_linux_audit_plugin_dir: ""
+    roottrace_linux_audit_plugin_flush_seconds: 2
+    roottrace_linux_audit_plugin_minimal_host: true
+    roottrace_linux_audit_reload_auditd: true
+    roottrace_linux_audit_max_bytes_per_cycle: 4194304
+    roottrace_linux_audit_initial_lookback_bytes: 1048576
+    roottrace_linux_audit_resolve_users: true
+    roottrace_linux_audit_uid_cache_size: 4096
+    roottrace_install_dir: /opt/roottrace-collector
+    roottrace_state_dir: /var/lib/roottrace-collector
+    roottrace_config_dir: /etc/roottrace
+    roottrace_collector_user: roottrace-collector
+    roottrace_service_name: ""
+    roottrace_service_type: ""
+    roottrace_check_ports: ""
+    roottrace_process_names: ""
+    roottrace_systemd_units: ""
+    roottrace_docker_api_check: "false"
+    roottrace_docker_socket: ""
+    roottrace_disk_paths: ""
+    roottrace_mongodb_uri: ""
+    roottrace_mongodb_targets: ""
+    roottrace_postgres_dsn: ""
+    roottrace_postgres_targets: ""
+    roottrace_postgres_username: ""
+    roottrace_postgres_password: ""
+    roottrace_mysql_dsn: ""
+    roottrace_mysql_targets: ""
+    roottrace_mysql_username: ""
+    roottrace_mysql_password: ""
+    roottrace_redis_targets: ""
+    roottrace_redis_password: ""
+    roottrace_rabbitmq_api_url: ""
+    roottrace_rabbitmq_username: ""
+    roottrace_rabbitmq_password: ""
+    roottrace_rabbitmq_vhost: ""
+    roottrace_elasticsearch_urls: ""
+    roottrace_elasticsearch_username: ""
+    roottrace_elasticsearch_password: ""
+    roottrace_clickhouse_urls: ""
+    roottrace_clickhouse_username: ""
+    roottrace_clickhouse_password: ""
+    roottrace_cassandra_contact_points: ""
+    roottrace_cassandra_username: ""
+    roottrace_cassandra_password: ""
+    roottrace_nginx_log_access: true
+    roottrace_nginx_access_log_paths: ""
+    roottrace_nginx_error_log_paths: ""
+    roottrace_nginx_status_urls: ""
+    roottrace_nginx_username: ""
+    roottrace_nginx_password: ""
+    roottrace_apache_status_urls: ""
+    roottrace_apache_username: ""
+    roottrace_apache_password: ""
+    roottrace_haproxy_stats_urls: ""
+    roottrace_haproxy_username: ""
+    roottrace_haproxy_password: ""
+    roottrace_eks_cluster_name: ""
+    roottrace_custom_metrics_paths: "{{ roottrace_install_dir }}/additional_monitors,/etc/roottrace/custom_metrics.d"
+    roottrace_custom_metrics_max_files: 16
+    roottrace_keda_kubeconfig: ""
+    roottrace_kubeconfig: ""
+    roottrace_kubeconfig_context: ""
+    roottrace_keda_kubeconfig_access: true
+    roottrace_keda_kubeconfig_default_paths:
+      - /etc/roottrace/kubeconfig
+      - /etc/kubernetes/admin.conf
+      - /etc/kubernetes/kubelet.conf
+      - /etc/rancher/k3s/k3s.yaml
+      - /etc/rancher/rke2/rke2.yaml
+      - /var/snap/microk8s/current/credentials/client.config
+    roottrace_extra_env: {}
+
+  pre_tasks:
+    - name: Require API URL
+      ansible.builtin.assert:
+        that:
+          - roottrace_api_url is defined
+          - roottrace_api_url is match('^https?://')
+        fail_msg: >-
+          roottrace_api_url is required and must be an absolute http or https
+          URL, for example https://roottrace.example.com/api.
+
+    - name: Require collector token
+      ansible.builtin.assert:
+        that:
+          - roottrace_collector_token is defined
+          - roottrace_collector_token | length > 0
+        fail_msg: roottrace_collector_token is required.
+      no_log: true
+
+    - name: Check python3 exists
+      ansible.builtin.command: python3 --version
+      changed_when: false
+
+  tasks:
+    - name: Create collector group
+      ansible.builtin.group:
+        name: "{{ roottrace_collector_user }}"
+        system: true
+
+    - name: Create collector user
+      ansible.builtin.user:
+        name: "{{ roottrace_collector_user }}"
+        group: "{{ roottrace_collector_user }}"
+        home: "{{ roottrace_state_dir }}"
+        shell: /usr/sbin/nologin
+        system: true
+        create_home: true
+
+    - name: Check systemd journal group
+      ansible.builtin.command: getent group systemd-journal
+      register: roottrace_systemd_journal_group
+      changed_when: false
+      failed_when: false
+
+    - name: Check adm journal group
+      ansible.builtin.command: getent group adm
+      register: roottrace_adm_group
+      changed_when: false
+      failed_when: false
+
+    - name: Build service-scoped journal groups
+      ansible.builtin.set_fact:
+        roottrace_journal_groups: >-
+          {{
+            []
+            if not (roottrace_kernel_journal_access | bool)
+            else
+            (['systemd-journal'] if roottrace_systemd_journal_group.rc == 0 else
+             (['adm'] if roottrace_adm_group.rc == 0 else []))
+          }}
+
+    - name: Create collector directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ roottrace_install_dir }}", owner: root, group: root, mode: "0755" }
+        - { path: "{{ roottrace_state_dir }}", owner: "{{ roottrace_collector_user }}", group: "{{ roottrace_collector_user }}", mode: "0750" }
+        - { path: "{{ roottrace_config_dir }}", owner: root, group: root, mode: "0755" }
+
+    - name: Check SELinux nis_enabled boolean
+      ansible.builtin.command:
+        argv:
+          - getsebool
+          - nis_enabled
+      register: roottrace_selinux_nis_enabled_state
+      changed_when: false
+      failed_when: false
+      when: roottrace_selinux_nis_enabled | bool
+
+    - name: Enable SELinux nis_enabled boolean for RootTrace audit identity lookups
+      ansible.builtin.command:
+        argv:
+          - setsebool
+          - -P
+          - nis_enabled
+          - "1"
+      when:
+        - roottrace_selinux_nis_enabled | bool
+        - roottrace_selinux_nis_enabled_state.rc | default(1) == 0
+        - "'--> on' not in (roottrace_selinux_nis_enabled_state.stdout | default(''))"
+      register: roottrace_selinux_nis_set
+      changed_when: roottrace_selinux_nis_set.rc == 0
+      failed_when: false
+
+    - name: Check POSIX ACL support
+      ansible.builtin.command: setfacl --version
+      register: roottrace_setfacl
+      changed_when: false
+      failed_when: false
+      when: (roottrace_nginx_log_access | bool) or (roottrace_linux_audit_access | bool) or (roottrace_keda_kubeconfig_access | bool)
+
+    - name: Check default Nginx log directory
+      ansible.builtin.stat:
+        path: /var/log/nginx
+        follow: false
+      register: roottrace_nginx_log_dir
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+
+    - name: Grant collector traversal on Nginx log directory
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:--x"
+          - /var/log/nginx
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - roottrace_nginx_log_dir.stat.isdir | default(false)
+        - not (roottrace_nginx_log_dir.stat.islnk | default(false))
+
+    - name: Grant read-only default ACL for future Nginx logs
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "d:u:{{ roottrace_collector_user }}:r--"
+          - /var/log/nginx
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - roottrace_nginx_log_dir.stat.isdir | default(false)
+        - not (roottrace_nginx_log_dir.stat.islnk | default(false))
+
+    - name: Find existing default Nginx logs
+      ansible.builtin.find:
+        paths: /var/log/nginx
+        patterns:
+          - access.log
+          - access.log.1
+          - error.log
+          - error.log.1
+        file_type: file
+        recurse: false
+        follow: false
+      register: roottrace_nginx_default_logs
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - roottrace_nginx_log_dir.stat.isdir | default(false)
+
+    - name: Grant read-only ACL on existing default Nginx logs
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:r--"
+          - "{{ item.path }}"
+      loop: "{{ roottrace_nginx_default_logs.files | default([]) }}"
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - not (item.islnk | default(false))
+
+    - name: Build configured Nginx log ACL list
+      ansible.builtin.set_fact:
+        roottrace_nginx_configured_logs: "{{ ((roottrace_nginx_access_log_paths | default('')) + ',' + (roottrace_nginx_error_log_paths | default(''))).split(',') | map('trim') | reject('equalto', '') | list }}"
+      when: roottrace_nginx_log_access | bool
+
+    - name: Check configured Nginx log files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop: "{{ roottrace_nginx_configured_logs | default([]) }}"
+      register: roottrace_nginx_configured_log_stats
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+
+    - name: Grant collector traversal on configured Nginx log directories
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:--x"
+          - "{{ item.stat.path | dirname }}"
+      loop: "{{ roottrace_nginx_configured_log_stats.results | default([]) }}"
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Grant read-only default ACL on configured Nginx log directories
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "d:u:{{ roottrace_collector_user }}:r--"
+          - "{{ item.stat.path | dirname }}"
+      loop: "{{ roottrace_nginx_configured_log_stats.results | default([]) }}"
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Grant read-only ACL on configured Nginx logs
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:r--"
+          - "{{ item.stat.path }}"
+      loop: "{{ roottrace_nginx_configured_log_stats.results | default([]) }}"
+      when:
+        - roottrace_nginx_log_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Check default Linux audit log directory
+      ansible.builtin.stat:
+        path: /var/log/audit
+        follow: false
+      register: roottrace_linux_audit_log_dir
+      when:
+        - roottrace_linux_audit_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+
+    - name: Grant collector traversal on Linux audit log directory
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:--x"
+          - /var/log/audit
+      when:
+        - roottrace_linux_audit_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - roottrace_linux_audit_log_dir.stat.isdir | default(false)
+        - not (roottrace_linux_audit_log_dir.stat.islnk | default(false))
+
+    - name: Grant read-only default ACL for future Linux audit logs
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "d:u:{{ roottrace_collector_user }}:r--"
+          - /var/log/audit
+      when:
+        - roottrace_linux_audit_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - roottrace_linux_audit_log_dir.stat.isdir | default(false)
+        - not (roottrace_linux_audit_log_dir.stat.islnk | default(false))
+
+    - name: Build configured Linux audit log ACL list
+      ansible.builtin.set_fact:
+        roottrace_linux_audit_configured_logs: "{{ (roottrace_linux_audit_log_paths | default('/var/log/audit/audit.log')).split(',') | map('trim') | reject('equalto', '') | list }}"
+      when: roottrace_linux_audit_access | bool
+
+    - name: Check configured Linux audit log files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop: "{{ roottrace_linux_audit_configured_logs | default([]) }}"
+      register: roottrace_linux_audit_configured_log_stats
+      when:
+        - roottrace_linux_audit_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+
+    - name: Grant collector traversal on configured Linux audit log directories
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:--x"
+          - "{{ item.stat.path | dirname }}"
+      loop: "{{ roottrace_linux_audit_configured_log_stats.results | default([]) }}"
+      when:
+        - roottrace_linux_audit_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Grant read-only ACL on configured Linux audit logs
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:r--"
+          - "{{ item.stat.path }}"
+      loop: "{{ roottrace_linux_audit_configured_log_stats.results | default([]) }}"
+      when:
+        - roottrace_linux_audit_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Build Kubernetes kubeconfig ACL list
+      ansible.builtin.set_fact:
+        roottrace_keda_kubeconfig_acl_paths: "{{ ([roottrace_keda_kubeconfig, roottrace_kubeconfig, roottrace_extra_env.get('ROOTTRACE_KEDA_KUBECONFIG', ''), roottrace_extra_env.get('ROOTTRACE_KUBERNETES_KUBECONFIG', ''), roottrace_extra_env.get('ROOTTRACE_KUBECONFIG', ''), roottrace_extra_env.get('KUBECONFIG', '')] + roottrace_keda_kubeconfig_default_paths) | map('trim') | reject('equalto', '') | unique | list }}"
+      when: roottrace_keda_kubeconfig_access | bool
+
+    - name: Check Kubernetes kubeconfig ACL targets
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop: "{{ roottrace_keda_kubeconfig_acl_paths | default([]) }}"
+      register: roottrace_keda_kubeconfig_stats
+      when:
+        - roottrace_keda_kubeconfig_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+
+    - name: Grant collector traversal on Kubernetes kubeconfig directories
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:--x"
+          - "{{ item.stat.path | dirname }}"
+      loop: "{{ roottrace_keda_kubeconfig_stats.results | default([]) }}"
+      when:
+        - roottrace_keda_kubeconfig_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Grant read-only ACL on Kubernetes kubeconfig files
+      ansible.builtin.command:
+        argv:
+          - setfacl
+          - -m
+          - "u:{{ roottrace_collector_user }}:r--"
+          - "{{ item.stat.path }}"
+      loop: "{{ roottrace_keda_kubeconfig_stats.results | default([]) }}"
+      when:
+        - roottrace_keda_kubeconfig_access | bool
+        - (roottrace_setfacl.rc | default(1)) == 0
+        - item.stat.exists | default(false)
+        - item.stat.isreg | default(false)
+        - not (item.stat.islnk | default(false))
+
+    - name: Inspect bundled collector source beside bundle root
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../roottrace_collector.py"
+      register: roottrace_collector_source_parent
+
+    - name: Inspect bundled collector source beside playbook
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/roottrace_collector.py"
+      register: roottrace_collector_source_local
+
+    - name: Inspect bundled compiled collector artifacts
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../compiled"
+      register: roottrace_compiled_collector_dir
+
+    - name: Inspect bundled additional monitors
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../additional_monitors"
+      register: roottrace_additional_monitors_dir
+
+    - name: Require source or compiled collector runtime
+      ansible.builtin.fail:
+        msg: "Collector bundle must include roottrace_collector.py or compiled collector artifacts."
+      when:
+        - not (roottrace_collector_source_parent.stat.exists | default(false))
+        - not (roottrace_collector_source_local.stat.exists | default(false))
+        - not (roottrace_compiled_collector_dir.stat.isdir | default(false))
+
+    - name: Install collector script from bundle root
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../roottrace_collector.py"
+        dest: "{{ roottrace_install_dir }}/roottrace_collector.py"
+        owner: root
+        group: root
+        mode: "0755"
+      when: roottrace_collector_source_parent.stat.exists | default(false)
+
+    - name: Install collector script from playbook directory
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/roottrace_collector.py"
+        dest: "{{ roottrace_install_dir }}/roottrace_collector.py"
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - not (roottrace_collector_source_parent.stat.exists | default(false))
+        - roottrace_collector_source_local.stat.exists | default(false)
+
+    - name: Remove stale collector source for compiled-only bundle
+      ansible.builtin.file:
+        path: "{{ roottrace_install_dir }}/roottrace_collector.py"
+        state: absent
+      when:
+        - not (roottrace_collector_source_parent.stat.exists | default(false))
+        - not (roottrace_collector_source_local.stat.exists | default(false))
+        - roottrace_compiled_collector_dir.stat.isdir | default(false)
+
+    - name: Install collector launcher
+      ansible.builtin.copy:
+        src: "{{ lookup('first_found', {'files': [playbook_dir + '/../install/roottrace_collector_launcher.py', playbook_dir + '/roottrace_collector_launcher.py']}) }}"
+        dest: "{{ roottrace_install_dir }}/roottrace_collector_launcher.py"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install collector runtime wrapper
+      ansible.builtin.copy:
+        src: "{{ lookup('first_found', {'files': [playbook_dir + '/../install/run_collector.sh', playbook_dir + '/run_collector.sh']}) }}"
+        dest: "{{ roottrace_install_dir }}/run_collector.sh"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install bundled compiled collector artifacts
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../compiled"
+        dest: "{{ roottrace_install_dir }}/"
+        owner: root
+        group: root
+        mode: preserve
+      when: roottrace_compiled_collector_dir.stat.isdir | default(false)
+
+    - name: Remove stale compiled collector artifacts when source bundle has none
+      ansible.builtin.file:
+        path: "{{ roottrace_install_dir }}/compiled"
+        state: absent
+      when: not (roottrace_compiled_collector_dir.stat.isdir | default(false))
+
+    - name: Install bundled additional monitors
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../additional_monitors"
+        dest: "{{ roottrace_install_dir }}/"
+        owner: root
+        group: root
+        mode: preserve
+      when: roottrace_additional_monitors_dir.stat.isdir | default(false)
+
+    - name: Remove stale additional monitors when bundle has none
+      ansible.builtin.file:
+        path: "{{ roottrace_install_dir }}/additional_monitors"
+        state: absent
+      when: not (roottrace_additional_monitors_dir.stat.isdir | default(false))
+
+    - name: Write collector environment file
+      ansible.builtin.copy:
+        dest: "{{ roottrace_config_dir }}/collector.env"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          ROOTTRACE_API_URL={{ roottrace_api_url }}
+          ROOTTRACE_COLLECTOR_TOKEN={{ roottrace_collector_token }}
+          ROOTTRACE_INTERVAL_SECONDS={{ roottrace_interval_seconds }}
+          ROOTTRACE_MAX_RUNTIME_SECONDS={{ roottrace_max_runtime_seconds }}
+          ROOTTRACE_STREAMING={{ roottrace_streaming }}
+          ROOTTRACE_ENABLED_CHECKS={{ roottrace_enabled_checks }}
+          ROOTTRACE_KERNEL_JOURNAL_ACCESS={{ roottrace_kernel_journal_access | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_ENABLED={{ roottrace_linux_audit_enabled | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_ACCESS={{ roottrace_linux_audit_access | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_LOG_PATHS={{ roottrace_linux_audit_log_paths }}
+          ROOTTRACE_LINUX_AUDIT_BATCH_EVENTS={{ roottrace_linux_audit_batch_events }}
+          ROOTTRACE_LINUX_AUDIT_STREAMING={{ roottrace_linux_audit_streaming | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_AUDITD_PLUGIN={{ roottrace_linux_audit_auditd_plugin | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_STIG_RULES={{ roottrace_linux_audit_stig_rules | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_BACKLOG_LIMIT={{ roottrace_linux_audit_backlog_limit }}
+          ROOTTRACE_LINUX_AUDIT_BACKLOG_WAIT_TIME={{ roottrace_linux_audit_backlog_wait_time }}
+          ROOTTRACE_LINUX_AUDIT_RULES_DIR={{ roottrace_linux_audit_rules_dir }}
+          ROOTTRACE_LINUX_AUDIT_PLUGIN_FLUSH_SECONDS={{ roottrace_linux_audit_plugin_flush_seconds }}
+          ROOTTRACE_LINUX_AUDIT_PLUGIN_MINIMAL_HOST={{ roottrace_linux_audit_plugin_minimal_host | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_RELOAD_AUDITD={{ roottrace_linux_audit_reload_auditd | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_MAX_BYTES_PER_CYCLE={{ roottrace_linux_audit_max_bytes_per_cycle }}
+          ROOTTRACE_LINUX_AUDIT_INITIAL_LOOKBACK_BYTES={{ roottrace_linux_audit_initial_lookback_bytes }}
+          ROOTTRACE_LINUX_AUDIT_RESOLVE_USERS={{ roottrace_linux_audit_resolve_users | string | lower }}
+          ROOTTRACE_LINUX_AUDIT_UID_CACHE_SIZE={{ roottrace_linux_audit_uid_cache_size }}
+          ROOTTRACE_CUSTOM_METRICS_PATHS={{ roottrace_custom_metrics_paths }}
+          ROOTTRACE_CUSTOM_METRICS_MAX_FILES={{ roottrace_custom_metrics_max_files }}
+          ROOTTRACE_SERVICE_NAME={{ roottrace_service_name }}
+          ROOTTRACE_SERVICE_TYPE={{ roottrace_service_type }}
+          ROOTTRACE_CHECK_PORTS={{ roottrace_check_ports }}
+          ROOTTRACE_PROCESS_NAMES={{ roottrace_process_names }}
+          ROOTTRACE_SYSTEMD_UNITS={{ roottrace_systemd_units }}
+          ROOTTRACE_DOCKER_API_CHECK={{ roottrace_docker_api_check }}
+          ROOTTRACE_DOCKER_SOCKET={{ roottrace_docker_socket }}
+          ROOTTRACE_DISK_PATHS={{ roottrace_disk_paths }}
+          ROOTTRACE_MONGODB_URI={{ roottrace_mongodb_uri }}
+          ROOTTRACE_MONGODB_TARGETS={{ roottrace_mongodb_targets }}
+          ROOTTRACE_POSTGRES_DSN={{ roottrace_postgres_dsn }}
+          ROOTTRACE_POSTGRES_TARGETS={{ roottrace_postgres_targets }}
+          ROOTTRACE_POSTGRES_USERNAME={{ roottrace_postgres_username }}
+          ROOTTRACE_POSTGRES_PASSWORD={{ roottrace_postgres_password }}
+          ROOTTRACE_MYSQL_DSN={{ roottrace_mysql_dsn }}
+          ROOTTRACE_MYSQL_TARGETS={{ roottrace_mysql_targets }}
+          ROOTTRACE_MYSQL_USERNAME={{ roottrace_mysql_username }}
+          ROOTTRACE_MYSQL_PASSWORD={{ roottrace_mysql_password }}
+          ROOTTRACE_REDIS_TARGETS={{ roottrace_redis_targets }}
+          ROOTTRACE_REDIS_PASSWORD={{ roottrace_redis_password }}
+          ROOTTRACE_RABBITMQ_API_URL={{ roottrace_rabbitmq_api_url }}
+          ROOTTRACE_RABBITMQ_USERNAME={{ roottrace_rabbitmq_username }}
+          ROOTTRACE_RABBITMQ_PASSWORD={{ roottrace_rabbitmq_password }}
+          ROOTTRACE_RABBITMQ_VHOST={{ roottrace_rabbitmq_vhost }}
+          ROOTTRACE_ELASTICSEARCH_URLS={{ roottrace_elasticsearch_urls }}
+          ROOTTRACE_ELASTICSEARCH_USERNAME={{ roottrace_elasticsearch_username }}
+          ROOTTRACE_ELASTICSEARCH_PASSWORD={{ roottrace_elasticsearch_password }}
+          ROOTTRACE_CLICKHOUSE_URLS={{ roottrace_clickhouse_urls }}
+          ROOTTRACE_CLICKHOUSE_USERNAME={{ roottrace_clickhouse_username }}
+          ROOTTRACE_CLICKHOUSE_PASSWORD={{ roottrace_clickhouse_password }}
+          ROOTTRACE_CASSANDRA_CONTACT_POINTS={{ roottrace_cassandra_contact_points }}
+          ROOTTRACE_CASSANDRA_USERNAME={{ roottrace_cassandra_username }}
+          ROOTTRACE_CASSANDRA_PASSWORD={{ roottrace_cassandra_password }}
+          ROOTTRACE_NGINX_LOG_ACCESS={{ roottrace_nginx_log_access | string | lower }}
+          ROOTTRACE_NGINX_STATUS_URLS={{ roottrace_nginx_status_urls }}
+          ROOTTRACE_NGINX_USERNAME={{ roottrace_nginx_username }}
+          ROOTTRACE_NGINX_PASSWORD={{ roottrace_nginx_password }}
+          ROOTTRACE_NGINX_ACCESS_LOG_PATHS={{ roottrace_nginx_access_log_paths }}
+          ROOTTRACE_NGINX_ERROR_LOG_PATHS={{ roottrace_nginx_error_log_paths }}
+          ROOTTRACE_APACHE_STATUS_URLS={{ roottrace_apache_status_urls }}
+          ROOTTRACE_APACHE_USERNAME={{ roottrace_apache_username }}
+          ROOTTRACE_APACHE_PASSWORD={{ roottrace_apache_password }}
+          ROOTTRACE_HAPROXY_STATS_URLS={{ roottrace_haproxy_stats_urls }}
+          ROOTTRACE_HAPROXY_USERNAME={{ roottrace_haproxy_username }}
+          ROOTTRACE_HAPROXY_PASSWORD={{ roottrace_haproxy_password }}
+          ROOTTRACE_EKS_CLUSTER_NAME={{ roottrace_eks_cluster_name }}
+          ROOTTRACE_KEDA_KUBECONFIG={{ roottrace_keda_kubeconfig }}
+          ROOTTRACE_KUBECONFIG={{ roottrace_kubeconfig }}
+          ROOTTRACE_KUBECONFIG_CONTEXT={{ roottrace_kubeconfig_context }}
+          {% for key, value in roottrace_extra_env.items() %}
+          {{ key }}={{ value }}
+          {% endfor %}
+      no_log: true
+
+    - name: Ensure RootTrace Linux audit rules directory exists
+      ansible.builtin.file:
+        path: "{{ roottrace_linux_audit_rules_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+
+    - name: Remove legacy RootTrace command execution audit rules
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ roottrace_linux_audit_rules_dir }}/roottrace-command-exec.rules"
+        - "{{ roottrace_linux_audit_rules_dir }}/20-roottrace-command-exec.rules"
+      when:
+        - roottrace_linux_audit_enabled | bool
+
+    - name: Install RootTrace RHEL 9 STIG audit reset rules
+      ansible.builtin.copy:
+        dest: "{{ roottrace_linux_audit_rules_dir }}/00-roottrace-rhel9-stig-reset.rules"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ## RootTrace RHEL 9 STIG V2R8 audit reset rules.
+          ## Keep augenrules reloads idempotent by clearing active audit rules before loading the generated ruleset.
+          -D
+          ## Raise the kernel audit backlog buffer well above the default of 64 so bursty
+          ## workloads (yum/dnf, package installs) do not fill the queue and get throttled.
+          -b {{ roottrace_linux_audit_backlog_limit }}
+          ## Do not block syscalls waiting for the audit queue to drain (0 = drop under
+          ## extreme burst instead of pausing the process). Set >0 to prefer completeness.
+          --backlog_wait_time {{ roottrace_linux_audit_backlog_wait_time }}
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+
+    - name: Install RootTrace RHEL 9 STIG audit rules
+      ansible.builtin.shell: |
+        set -eu
+        rule_file="{{ roottrace_linux_audit_rules_dir }}/30-roottrace-rhel9-stig.rules"
+        audit_native_arch() {
+          case "$(uname -m 2>/dev/null || true)" in
+            x86_64|amd64|aarch64|arm64|ppc64|ppc64le|s390x|riscv64) echo "b64" ;;
+            *)
+              if [ "$(getconf LONG_BIT 2>/dev/null || echo 64)" = "32" ]; then
+                echo "b32"
+              else
+                echo "b64"
+              fi
+              ;;
+          esac
+        }
+        audit_syscall_supported() {
+          syscall_name="$1"
+          if command -v ausyscall >/dev/null 2>&1; then
+            ausyscall --exact "$syscall_name" >/dev/null 2>&1 && return 0
+            if ausyscall --help 2>&1 | grep -q -- '--exact'; then
+              return 1
+            fi
+            if ausyscall --dump 2>/dev/null | awk -v syscall_name="$syscall_name" '$2 == syscall_name { found = 1 } END { exit found ? 0 : 1 }'; then
+              return 0
+            fi
+            return 1
+          fi
+          return 1
+        }
+        audit_syscall_equivalents() {
+          case "$1" in
+            chmod) echo "fchmodat fchmodat2" ;;
+            chown|lchown) echo "fchownat" ;;
+            rename) echo "renameat renameat2" ;;
+            unlink|rmdir) echo "unlinkat" ;;
+            open|creat) echo "openat openat2" ;;
+            umount) echo "umount2" ;;
+            *) return 1 ;;
+          esac
+        }
+        append_audit_syscall_rule() {
+          rule_id="$1"
+          syscall_names="$2"
+          filters="$3"
+          audit_arch="${ROOTTRACE_LINUX_AUDIT_ARCH:-$(audit_native_arch)}"
+          supported_syscalls=""
+          for syscall_name in $(printf '%s\n' "$syscall_names" | tr ',' ' '); do
+            if audit_syscall_supported "$syscall_name"; then
+              case " ${supported_syscalls} " in
+                *" ${syscall_name} "*) ;;
+                *) supported_syscalls="${supported_syscalls}${supported_syscalls:+ }${syscall_name}" ;;
+              esac
+            else
+              equivalent_syscalls=""
+              for equivalent_syscall in $(audit_syscall_equivalents "$syscall_name" 2>/dev/null || true); do
+                if audit_syscall_supported "$equivalent_syscall"; then
+                  case " ${supported_syscalls} ${equivalent_syscalls} " in
+                    *" ${equivalent_syscall} "*) ;;
+                    *) equivalent_syscalls="${equivalent_syscalls}${equivalent_syscalls:+ }${equivalent_syscall}" ;;
+                  esac
+                fi
+              done
+              if [ -n "$equivalent_syscalls" ]; then
+                echo "RootTrace: audit syscall ${syscall_name} is not available for ${rule_id} on $(uname -m 2>/dev/null || echo unknown); covering it with native syscall(s): ${equivalent_syscalls}." >&2
+                for equivalent_syscall in $equivalent_syscalls; do
+                  case " ${supported_syscalls} " in
+                    *" ${equivalent_syscall} "*) ;;
+                    *) supported_syscalls="${supported_syscalls}${supported_syscalls:+ }${equivalent_syscall}" ;;
+                  esac
+                done
+              else
+                echo "RootTrace: failed to add audit syscall ${syscall_name} for ${rule_id}: syscall is unsupported or could not be verified, and no supported native equivalent was found; skipping this syscall so auditd can continue to start." >&2
+              fi
+            fi
+          done
+          if [ -z "$supported_syscalls" ]; then
+            echo "RootTrace: failed to add audit rule ${rule_id}: no listed syscalls or native equivalents are supported on this host; skipping this rule so auditd can continue to start." >&2
+            return 0
+          fi
+          {
+            printf '## %s\n' "$rule_id"
+            printf -- '-a always,exit -F arch=%s' "$audit_arch"
+            for syscall_name in $supported_syscalls; do
+              printf ' -S %s' "$syscall_name"
+            done
+            printf ' %s\n' "$filters"
+          } >> "$rule_file"
+        }
+        {
+          echo "## RootTrace RHEL 9 STIG V2R8 audit rules."
+          echo "## Syscall rules are generated for the host native audit arch and omit syscalls unsupported by this kernel audit table."
+        } > "$rule_file"
+        append_audit_syscall_rule "RHEL-09-654010 uid exec privilege" "execve" "-C uid!=euid -F euid=0 -k execpriv"
+        append_audit_syscall_rule "RHEL-09-654010 gid exec privilege" "execve" "-C gid!=egid -F egid=0 -k execpriv"
+        append_audit_syscall_rule "RHEL-09-654015 permission changes" "chmod,fchmod,fchmodat" "-F auid>=1000 -F auid!=unset -k perm_mod"
+        append_audit_syscall_rule "RHEL-09-654020 ownership changes" "chown,fchown,fchownat,lchown" "-F auid>=1000 -F auid!=unset -k perm_mod"
+        append_audit_syscall_rule "RHEL-09-654025 extended attribute changes by users" "setxattr,fsetxattr,lsetxattr,removexattr,fremovexattr,lremovexattr" "-F auid>=1000 -F auid!=unset -k perm_mod"
+        append_audit_syscall_rule "RHEL-09-654025 extended attribute changes by root" "setxattr,fsetxattr,lsetxattr,removexattr,fremovexattr,lremovexattr" "-F auid=0 -k perm_mod"
+        cat >> "$rule_file" <<'EOF'
+          ## RHEL-09-654030
+          -a always,exit -F path=/usr/bin/umount -F perm=x -F auid>=1000 -F auid!=unset -k privileged-mount
+          ## RHEL-09-654035
+          -a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_mod
+          ## RHEL-09-654040
+          -a always,exit -F path=/usr/bin/setfacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_mod
+          ## RHEL-09-654045
+          -a always,exit -F path=/usr/bin/chcon -F perm=x -F auid>=1000 -F auid!=unset -k perm_mod
+          ## RHEL-09-654050
+          -a always,exit -F path=/usr/sbin/semanage -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654055
+          -a always,exit -F path=/usr/sbin/setfiles -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654060
+          -a always,exit -F path=/usr/sbin/setsebool -F perm=x -F auid>=1000 -F auid!=unset -F key=privileged
+        EOF
+        append_audit_syscall_rule "RHEL-09-654065 deletions" "rename,unlink,rmdir,renameat,unlinkat" "-F auid>=1000 -F auid!=unset -k delete"
+        append_audit_syscall_rule "RHEL-09-654070 permission denied access" "truncate,ftruncate,creat,open,openat,open_by_handle_at" "-F exit=-EPERM -F auid>=1000 -F auid!=unset -k perm_access"
+        append_audit_syscall_rule "RHEL-09-654070 access denied access" "truncate,ftruncate,creat,open,openat,open_by_handle_at" "-F exit=-EACCES -F auid>=1000 -F auid!=unset -k perm_access"
+        append_audit_syscall_rule "RHEL-09-654075 module removal" "delete_module" "-F auid>=1000 -F auid!=unset -k module_chng"
+        append_audit_syscall_rule "RHEL-09-654080 module loading" "init_module,finit_module" "-F auid>=1000 -F auid!=unset -k module_chng"
+        cat >> "$rule_file" <<'EOF'
+          ## RHEL-09-654085
+          -a always,exit -F path=/usr/bin/chage -F perm=x -F auid>=1000 -F auid!=unset -k privileged-chage
+          ## RHEL-09-654090
+          -a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+          ## RHEL-09-654095
+          -a always,exit -F path=/usr/bin/crontab -F perm=x -F auid>=1000 -F auid!=unset -k privileged-crontab
+          ## RHEL-09-654100
+          -a always,exit -F path=/usr/bin/gpasswd -F perm=x -F auid>=1000 -F auid!=unset -k privileged-gpasswd
+          ## RHEL-09-654105
+          -a always,exit -F path=/usr/bin/kmod -F perm=x -F auid>=1000 -F auid!=unset -k modules
+          ## RHEL-09-654110
+          -a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+          ## RHEL-09-654115
+          -a always,exit -F path=/usr/sbin/pam_timestamp_check -F perm=x -F auid>=1000 -F auid!=unset -k privileged-pam_timestamp_check
+          ## RHEL-09-654120
+          -a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=unset -k privileged-passwd
+          ## RHEL-09-654125
+          -a always,exit -F path=/usr/sbin/postdrop -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654130
+          -a always,exit -F path=/usr/sbin/postqueue -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654135
+          -a always,exit -F path=/usr/bin/ssh-agent -F perm=x -F auid>=1000 -F auid!=unset -k privileged-ssh
+          ## RHEL-09-654140
+          -a always,exit -F path=/usr/libexec/openssh/ssh-keysign -F perm=x -F auid>=1000 -F auid!=unset -k privileged-ssh
+          ## RHEL-09-654145
+          -a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=unset -k privileged-priv_change
+          ## RHEL-09-654150
+          -a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+          ## RHEL-09-654155
+          -a always,exit -F path=/usr/bin/sudoedit -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+          ## RHEL-09-654160
+          -a always,exit -F path=/usr/sbin/unix_chkpwd -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654165
+          -a always,exit -F path=/usr/sbin/unix_update -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654170
+          -a always,exit -F path=/usr/sbin/userhelper -F perm=x -F auid>=1000 -F auid!=unset -k privileged-unix-update
+          ## RHEL-09-654175
+          -a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=unset -k privileged-usermod
+          ## RHEL-09-654180
+          -a always,exit -F path=/usr/bin/mount -F perm=x -F auid>=1000 -F auid!=unset -k privileged-mount
+          ## RHEL-09-654185
+          -a always,exit -F path=/usr/sbin/init -F perm=x -F auid>=1000 -F auid!=unset -k privileged-init
+          ## RHEL-09-654190
+          -a always,exit -F path=/usr/sbin/poweroff -F perm=x -F auid>=1000 -F auid!=unset -k privileged-poweroff
+          ## RHEL-09-654195
+          -a always,exit -F path=/usr/sbin/reboot -F perm=x -F auid>=1000 -F auid!=unset -k privileged-reboot
+          ## RHEL-09-654200
+          -a always,exit -F path=/usr/sbin/shutdown -F perm=x -F auid>=1000 -F auid!=unset -k privileged-shutdown
+        EOF
+        append_audit_syscall_rule "RHEL-09-654205 umount syscall" "umount" "-F auid>=1000 -F auid!=unset -k privileged-umount"
+        append_audit_syscall_rule "RHEL-09-654210 umount2 syscall" "umount2" "-F auid>=1000 -F auid!=unset -k privileged-umount"
+        cat >> "$rule_file" <<'EOF'
+          ## RHEL-09-654215
+          -w /etc/sudoers -p wa -k identity
+          ## RHEL-09-654220
+          -w /etc/sudoers.d/ -p wa -k identity
+          ## RHEL-09-654225
+          -w /etc/group -p wa -k identity
+          ## RHEL-09-654230
+          -w /etc/gshadow -p wa -k identity
+          ## RHEL-09-654235
+          -w /etc/security/opasswd -p wa -k identity
+          ## RHEL-09-654240
+          -w /etc/passwd -p wa -k identity
+          ## RHEL-09-654245
+          -w /etc/shadow -p wa -k identity
+          ## RHEL-09-654250
+          -w /var/log/faillock -p wa -k logins
+          ## RHEL-09-654255
+          -w /var/log/lastlog -p wa -k logins
+          ## RHEL-09-654096
+          -w /etc/cron.d/ -p wa -k cronjobs
+          -w /var/spool/cron/ -p wa -k cronjobs
+        EOF
+        chown root:root "$rule_file"
+        chmod 0640 "$rule_file"
+      args:
+        executable: /bin/sh
+      register: roottrace_stig_audit_rules_install
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+
+    - name: Show RootTrace STIG audit rules skipped for this architecture
+      ansible.builtin.debug:
+        msg: "{{ roottrace_stig_audit_rules_install.stderr_lines }}"
+      when:
+        - roottrace_stig_audit_rules_install is defined
+        - (roottrace_stig_audit_rules_install.stderr_lines | default([])) | length > 0
+
+    - name: Install RootTrace RHEL 9 STIG audit finalization rules
+      ansible.builtin.copy:
+        dest: "{{ roottrace_linux_audit_rules_dir }}/99-roottrace-rhel9-stig-finalize.rules"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ## RootTrace RHEL 9 STIG V2R8 audit finalization rules.
+          ## RHEL-09-654265
+          -f 2
+          ## RHEL-09-654270
+          --loginuid-immutable
+          ## RHEL-09-654275
+          -e 2
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+
+    - name: Locate augenrules for RootTrace Linux audit rules
+      ansible.builtin.shell: command -v augenrules
+      register: roottrace_augenrules_path
+      changed_when: false
+      failed_when: false
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+
+    - name: Locate auditctl for RootTrace Linux audit rules
+      ansible.builtin.shell: command -v auditctl
+      register: roottrace_auditctl_path
+      changed_when: false
+      failed_when: false
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+        - (roottrace_augenrules_path.stdout | default('')) | length == 0
+
+    - name: Check generated RootTrace Linux audit rules with augenrules
+      ansible.builtin.command:
+        argv:
+          - "{{ roottrace_augenrules_path.stdout }}"
+          - --check
+      register: roottrace_augenrules_check
+      changed_when: false
+      failed_when: false
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+        - (roottrace_augenrules_path.stdout | default('')) | length > 0
+
+    - name: Disable generated RootTrace Linux audit rules when augenrules check fails
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ roottrace_linux_audit_rules_dir }}/00-roottrace-rhel9-stig-reset.rules"
+        - "{{ roottrace_linux_audit_rules_dir }}/30-roottrace-rhel9-stig.rules"
+        - "{{ roottrace_linux_audit_rules_dir }}/99-roottrace-rhel9-stig-finalize.rules"
+      when:
+        - roottrace_augenrules_check is defined
+        - (roottrace_augenrules_check.rc | default(0)) != 0
+
+    - name: Warn when RootTrace audit rules are disabled after augenrules check
+      ansible.builtin.debug:
+        msg: "RootTrace generated audit rules failed augenrules --check and were removed so auditd can continue to start. Review the earlier RootTrace audit-rule warnings for the unsupported rule or syscall."
+      when:
+        - roottrace_augenrules_check is defined
+        - (roottrace_augenrules_check.rc | default(0)) != 0
+
+    - name: Restart audit-rules.service for RootTrace Linux audit rules
+      ansible.builtin.shell: |
+        set -eu
+        if ! command -v systemctl >/dev/null 2>&1; then
+          exit 2
+        fi
+        load_state="$(systemctl show audit-rules.service -p LoadState --value 2>/dev/null || true)"
+        if [ "$load_state" != "loaded" ]; then
+          exit 2
+        fi
+        systemctl restart audit-rules.service
+        result="$(systemctl show audit-rules.service -p Result --value 2>/dev/null || true)"
+        exec_status="$(systemctl show audit-rules.service -p ExecMainStatus --value 2>/dev/null || true)"
+        if [ "$result" = "success" ] && [ "$exec_status" = "0" ]; then
+          echo "RootTrace: restarted audit-rules.service and confirmed audit rules loaded successfully."
+          exit 0
+        fi
+        echo "RootTrace: audit-rules.service restart did not confirm success (Result=${result:-unknown}, ExecMainStatus=${exec_status:-unknown})." >&2
+        exit 1
+      args:
+        executable: /bin/sh
+      register: roottrace_audit_rules_service_restart
+      changed_when: roottrace_audit_rules_service_restart.rc == 0
+      failed_when: false
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_reload_auditd | bool
+        - roottrace_linux_audit_stig_rules | bool
+        - (roottrace_augenrules_check.rc | default(0)) == 0
+
+    - name: Show audit-rules.service RootTrace confirmation
+      ansible.builtin.debug:
+        msg: "{{ roottrace_audit_rules_service_restart.stdout_lines }}"
+      when:
+        - roottrace_audit_rules_service_restart is defined
+        - (roottrace_audit_rules_service_restart.rc | default(1)) == 0
+        - (roottrace_audit_rules_service_restart.stdout_lines | default([])) | length > 0
+
+    - name: Load RootTrace Linux audit rules with augenrules
+      ansible.builtin.command:
+        argv:
+          - "{{ roottrace_augenrules_path.stdout }}"
+          - --load
+      register: roottrace_augenrules_load
+      changed_when: false
+      failed_when: false
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+        - (roottrace_augenrules_path.stdout | default('')) | length > 0
+        - (roottrace_augenrules_check.rc | default(0)) == 0
+        - (roottrace_audit_rules_service_restart.rc | default(2)) != 0
+
+    - name: Load RootTrace Linux audit rules with auditctl
+      ansible.builtin.command:
+        argv:
+          - "{{ roottrace_auditctl_path.stdout }}"
+          - -R
+          - "{{ item.path }}"
+      loop:
+        - path: "{{ roottrace_linux_audit_rules_dir }}/30-roottrace-rhel9-stig.rules"
+          enabled: "{{ roottrace_linux_audit_stig_rules | bool }}"
+        - path: "{{ roottrace_linux_audit_rules_dir }}/99-roottrace-rhel9-stig-finalize.rules"
+          enabled: "{{ roottrace_linux_audit_stig_rules | bool }}"
+      register: roottrace_auditctl_load
+      changed_when: false
+      failed_when: false
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - item.enabled | bool
+        - (roottrace_augenrules_path.stdout | default('')) | length == 0
+        - (roottrace_auditctl_path.stdout | default('')) | length > 0
+        - (roottrace_audit_rules_service_restart.rc | default(2)) != 0
+
+    - name: Disable generated RootTrace Linux audit rules when immediate load fails
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ roottrace_linux_audit_rules_dir }}/00-roottrace-rhel9-stig-reset.rules"
+        - "{{ roottrace_linux_audit_rules_dir }}/30-roottrace-rhel9-stig.rules"
+        - "{{ roottrace_linux_audit_rules_dir }}/99-roottrace-rhel9-stig-finalize.rules"
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_stig_rules | bool
+        - >
+          (roottrace_augenrules_load.rc | default(0)) != 0 or
+          ((roottrace_auditctl_load.results | default([])) | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list | length) > 0
+
+    - name: Warn when generated RootTrace Linux audit rules are disabled after load failure
+      ansible.builtin.debug:
+        msg: "RootTrace could not load generated Linux audit rules immediately, so it removed the RootTrace-managed audit rule files instead of risking auditd startup."
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - >
+          (roottrace_augenrules_load.rc | default(0)) != 0 or
+          ((roottrace_auditctl_load.results | default([])) | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list | length) > 0
+
+    - name: Inspect modern auditd plugin directory
+      ansible.builtin.stat:
+        path: /etc/audit/plugins.d
+      register: roottrace_audit_plugin_dir
+      when: roottrace_linux_audit_enabled | bool and roottrace_linux_audit_auditd_plugin | bool
+
+    - name: Inspect modern auditd configuration directory
+      ansible.builtin.stat:
+        path: /etc/audit
+      register: roottrace_audit_config_dir
+      when: roottrace_linux_audit_enabled | bool and roottrace_linux_audit_auditd_plugin | bool
+
+    - name: Inspect legacy audisp plugin directory
+      ansible.builtin.stat:
+        path: /etc/audisp/plugins.d
+      register: roottrace_audisp_plugin_dir
+      when: roottrace_linux_audit_enabled | bool and roottrace_linux_audit_auditd_plugin | bool
+
+    - name: Inspect legacy audisp configuration directory
+      ansible.builtin.stat:
+        path: /etc/audisp
+      register: roottrace_audisp_config_dir
+      when: roottrace_linux_audit_enabled | bool and roottrace_linux_audit_auditd_plugin | bool
+
+    - name: Select configured auditd plugin directory
+      ansible.builtin.set_fact:
+        roottrace_effective_auditd_plugin_dir: "{{ roottrace_linux_audit_plugin_dir }}"
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_auditd_plugin | bool
+        - roottrace_linux_audit_plugin_dir | length > 0
+
+    - name: Select modern auditd plugin directory
+      ansible.builtin.set_fact:
+        roottrace_effective_auditd_plugin_dir: /etc/audit/plugins.d
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_auditd_plugin | bool
+        - roottrace_linux_audit_plugin_dir | length == 0
+        - roottrace_effective_auditd_plugin_dir is not defined
+        - (roottrace_audit_plugin_dir.stat.isdir | default(false)) or (roottrace_audit_config_dir.stat.isdir | default(false))
+
+    - name: Select legacy audisp plugin directory
+      ansible.builtin.set_fact:
+        roottrace_effective_auditd_plugin_dir: /etc/audisp/plugins.d
+      when:
+        - roottrace_linux_audit_enabled | bool
+        - roottrace_linux_audit_auditd_plugin | bool
+        - roottrace_linux_audit_plugin_dir | length == 0
+        - roottrace_effective_auditd_plugin_dir is not defined
+        - (roottrace_audisp_plugin_dir.stat.isdir | default(false)) or (roottrace_audisp_config_dir.stat.isdir | default(false))
+
+    - name: Ensure RootTrace auditd plugin directory exists
+      ansible.builtin.file:
+        path: "{{ roottrace_effective_auditd_plugin_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: roottrace_effective_auditd_plugin_dir is defined
+
+    - name: Locate python3 for RootTrace auditd plugin
+      ansible.builtin.command: command -v python3
+      register: roottrace_python3_path
+      changed_when: false
+      failed_when: false
+      when: roottrace_effective_auditd_plugin_dir is defined
+
+    - name: Install RootTrace auditd plugin wrapper
+      ansible.builtin.copy:
+        dest: "{{ roottrace_install_dir }}/roottrace_auditd_plugin.sh"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          set -eu
+          # Keep this auditd child side-effect free under SELinux auditd_t.
+          export PYTHONDONTWRITEBYTECODE=1
+          export PYTHONUNBUFFERED=1
+          export ROOTTRACE_LINUX_AUDIT_PLUGIN_MINIMAL_HOST=true
+          exec "{{ roottrace_install_dir }}/run_collector.sh" --env-file "{{ roottrace_config_dir }}/collector.env" --auditd-plugin
+      when:
+        - roottrace_effective_auditd_plugin_dir is defined
+        - (roottrace_python3_path.stdout | default('')) | length > 0
+      no_log: true
+
+    - name: Install RootTrace auditd plugin configuration
+      ansible.builtin.copy:
+        dest: "{{ roottrace_effective_auditd_plugin_dir }}/roottrace.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          active = yes
+          direction = out
+          path = {{ roottrace_install_dir }}/roottrace_auditd_plugin.sh
+          type = always
+          format = string
+      when: roottrace_effective_auditd_plugin_dir is defined
+
+    - name: Reload auditd for RootTrace plugin
+      ansible.builtin.command: service auditd reload
+      changed_when: false
+      failed_when: false
+      when:
+        - roottrace_effective_auditd_plugin_dir is defined
+        - roottrace_linux_audit_reload_auditd | bool
+
+    - name: Install systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/roottrace-collector.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=RootTrace read-only diagnostics collector
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ roottrace_collector_user }}
+          Group={{ roottrace_collector_user }}
+          {% if roottrace_journal_groups | length > 0 %}
+          SupplementaryGroups={{ roottrace_journal_groups | join(' ') }}
+          {% endif %}
+          EnvironmentFile={{ roottrace_config_dir }}/collector.env
+          ExecStart={{ roottrace_install_dir }}/run_collector.sh --loop
+          RuntimeMaxSec={{ roottrace_max_runtime_seconds }}
+          Restart=always
+          RestartSec=15
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ProtectKernelTunables=true
+          ProtectKernelModules=true
+          ProtectControlGroups=true
+          ReadWritePaths={{ roottrace_state_dir }}
+          CapabilityBoundingSet=
+          AmbientCapabilities=
+          LockPersonality=true
+          RestrictSUIDSGID=true
+          SystemCallArchitectures=native
+          RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start collector
+      ansible.builtin.systemd:
+        name: roottrace-collector.service
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Remove retired collector updater
+      ansible.builtin.file:
+        path: "{{ roottrace_install_dir }}/update_collector.sh"
+        state: absent

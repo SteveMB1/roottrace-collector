@@ -1,0 +1,20 @@
+#!/bin/sh
+# roottrace-collector postrm: the Debian twin of the RPM %postun scriptlet.
+set -e
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+case "$1" in
+  purge)
+    # remove keeps /etc/roottrace/collector.env (a conffile that can hold
+    # credentials the operator may still need); purge is the explicit ask to
+    # drop config and state too. dpkg deletes the conffile itself; clear the
+    # runtime state and the config dir if nothing user-added remains. The
+    # system user stays, per Debian policy, so any stray files it owns are
+    # never orphaned to a recycled uid.
+    rm -rf /var/lib/roottrace-collector
+    rmdir /etc/roottrace 2>/dev/null || true
+    ;;
+esac
+
+exit 0
